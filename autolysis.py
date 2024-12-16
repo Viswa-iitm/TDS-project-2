@@ -1,80 +1,216 @@
 #!/usr/bin/env python3
 import os
 import sys
+import json
+import logging
+from typing import Dict, Any, Optional
+
 import pandas as pd
+import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
-import numpy as np
 import requests
-import json
+from dotenv import load_dotenv
 
-def json_serializable_dict(d):
-    """
-    Convert a dictionary with non-JSON serializable values to a JSON-friendly format.
-    """
-    serializable_dict = {}
-    for k, v in d.items():
-        if isinstance(v, dict):
-            serializable_dict[k] = json_serializable_dict(v)
-        elif isinstance(v, list):
-            serializable_dict[k] = [
-                json_serializable_dict(elem) if isinstance(elem, dict) else
-                elem.item() if isinstance(elem, (np.integer, np.floating)) else
-                elem for elem in v
-            ]
-        elif isinstance(v, np.ndarray):
-            serializable_dict[k] = v.tolist()
-        elif isinstance(v, (np.integer, np.floating)):
-            serializable_dict[k] = v.item()
-        elif pd.isna(v):
-            serializable_dict[k] = None
-        else:
-            try:
-                json.dumps(v)
-                serializable_dict[k] = v
-            except TypeError:
-                serializable_dict[k] = str(v)
-    return serializable_dict
+class DataAnalysisError(Exception):
+    """Custom exception for data analysis errors."""
+    pass
+
+class DataRecommendationGenerator:
+    """Generate data-driven recommendations based on analysis."""
+    
+    @staticmethod
+    def generate_recommendations(analysis: Dict[str, Any], df: pd.DataFrame) -> str:
+        """
+        Generate data-driven recommendations based on analysis.
+        
+        Args:
+            analysis (Dict): Comprehensive dataset analysis
+            df (pd.DataFrame): Original dataframe
+        
+        Returns:
+            str: Generated recommendations
+        """
+        recommendations = []
+        
+        # Missing Data Recommendations
+        missing_data = analysis.get('missing_data', {})
+        missing_columns = [col for col, count in missing_data.items() if count > 0]
+        if missing_columns:
+            recommendations.append(f"Data Quality Alert: {len(missing_columns)} columns have missing data.")
+            recommendations.append("Recommendations:")
+            for col in missing_columns:
+                missing_percent = (missing_data[col] / len(df)) * 100
+                if missing_percent > 50:
+                    recommendations.append(f"- Consider dropping column '{col}' due to high missing data ({missing_percent:.2f}%)")
+                else:
+                    recommendations.append(f"- Investigate and potentially impute missing values in '{col}'")
+        
+        # Correlation Recommendations
+        correlation_matrix = analysis.get('correlation_matrix', {})
+        if correlation_matrix:
+            corr_df = pd.DataFrame(correlation_matrix)
+            high_correlations = []
+            
+            for col1 in corr_df.columns:
+                for col2 in corr_df.columns:
+                    if col1 != col2:
+                        corr_value = corr_df.loc[col1, col2]
+                        if abs(corr_value) > 0.8:
+                            high_correlations.append((col1, col2, corr_value))
+            
+            if high_correlations:
+                recommendations.append("Correlation Insights:")
+                for col1, col2, corr in high_correlations:
+                    recommendations.append(f"- Strong correlation between {col1} and {col2} (r = {corr:.2f})")
+                    recommendations.append(f"  Consider feature engineering or checking for multicollinearity")
+        
+        # Statistical Distribution Recommendations
+        numeric_columns = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_columns:
+            skewness = df[col].skew()
+            if abs(skewness) > 1:
+                direction = "right" if skewness > 0 else "left"
+                recommendations.append(f"- Column '{col}' shows significant {direction}-skewed distribution")
+                recommendations.append(f"  Consider applying transformation (log, sqrt) to normalize")
+        
+        return "\n".join(recommendations) if recommendations else "No specific recommendations could be generated."
 
 class DataAnalyzer:
-    def __init__(self, csv_path):
+    """Primary data analysis class with comprehensive analysis capabilities."""
+    
+    def __init__(self, csv_path: str, log_level: int = logging.INFO):
         """
-        Initialize the data analyzer with the given CSV file.
+        Initialize DataAnalyzer with logging and error handling.
+        
+        Args:
+            csv_path (str): Path to input CSV file
+            log_level (int): Logging level
         """
+        logging.basicConfig(
+            level=log_level, 
+            format='%(asctime)s - %(levelname)s: %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
         self.csv_path = csv_path
-        self.dataset_name = os.path.splitext(os.path.basename(csv_path))[0]  # Always set dataset_name
+        self.dataset_name = os.path.splitext(os.path.basename(csv_path))[0]
+        
+        self._load_dataset()
 
+    def _load_dataset(self) -> None:
+        """
+        Load dataset with robust encoding detection.
+        
+        Raises:
+            DataAnalysisError: If dataset cannot be loaded
+        """
+        encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
+        
+        for encoding in encodings:
+            try:
+                self.df = pd.read_csv(self.csv_path, encoding=encoding)
+                self.logger.info(f"Successfully loaded dataset using {encoding} encoding")
+                return
+            except Exception as e:
+                self.logger.warning(f"Failed to load dataset with {encoding} encoding: {e}")
+        
+        raise DataAnalysisError("Could not load dataset with any known encoding")
+
+    def analyze_data(self) -> Dict[str, Any]:
+        """
+        Perform comprehensive data analysis.
+        
+        Returns:
+            Dict: Comprehensive dataset analysis
+        """
         try:
-            encoding = 'utf-8'  # Default encoding
-            try:
-                import chardet
-                with open(csv_path, 'rb') as f:
-                    detected = chardet.detect(f.read())
-                    encoding = detected.get('encoding', 'utf-8')
-                    print(f"Detected encoding: {encoding}")
-            except ImportError:
-                print("chardet library not installed, defaulting to utf-8.")
-
-            self.df = pd.read_csv(csv_path, encoding=encoding)
-        except UnicodeDecodeError as e:
-            print(f"Encoding issue with file: {e}")
-            print("Trying with 'latin1' encoding...")
-            try:
-                self.df = pd.read_csv(csv_path, encoding='latin1')
-            except Exception as fallback_e:
-                print(f"Fallback failed: {fallback_e}")
-                sys.exit(1)
+            analysis = {
+                'basic_info': self._get_basic_info(),
+                'missing_data': self._get_missing_data(),
+                'summary_statistics': self._get_summary_statistics(),
+                'correlation_matrix': self._get_correlation_matrix()
+            }
+            return analysis
         except Exception as e:
-            print(f"Error reading CSV file: {e}")
-            sys.exit(1)
+            self.logger.error(f"Data analysis failed: {e}")
+            raise
 
-    def get_ai_summary(self, analysis_summary):
+    def _get_basic_info(self) -> Dict[str, Any]:
+        """Get basic dataset information."""
+        return {
+            'total_rows': len(self.df),
+            'columns': list(self.df.columns),
+            'column_types': {col: str(dtype) for col, dtype in self.df.dtypes.items()}
+        }
+
+    def _get_missing_data(self) -> Dict[str, int]:
+        """Calculate missing data for each column."""
+        return self.df.isnull().sum().to_dict()
+
+    def _get_summary_statistics(self) -> Dict[str, Dict]:
+        """Compute summary statistics for numeric columns."""
+        numeric_columns = self.df.select_dtypes(include=[np.number]).columns
+        return self.df[numeric_columns].describe().to_dict()
+
+    def _get_correlation_matrix(self) -> Optional[Dict]:
+        """Compute correlation matrix for numeric columns."""
+        numeric_columns = self.df.select_dtypes(include=[np.number]).columns
+        if len(numeric_columns) > 1:
+            return self.df[numeric_columns].corr().to_dict()
+        return None
+
+    def create_visualizations(self, analysis: Dict[str, Any]) -> None:
         """
-        Get AI-powered summary and insights using AI Proxy.
+        Create visualizations based on dataset analysis.
+        
+        Args:
+            analysis (Dict): Comprehensive dataset analysis
         """
-        api_token = input("Please enter API token:")
+        os.makedirs(self.dataset_name, exist_ok=True)
+        
+        # Correlation Heatmap
+        if analysis.get('correlation_matrix'):
+            plt.figure(figsize=(10, 8))
+            correlation_df = pd.DataFrame(analysis['correlation_matrix'])
+            sns.heatmap(correlation_df, annot=True, cmap='coolwarm', center=0)
+            plt.title(f'Correlation Heatmap - {self.dataset_name.capitalize()}')
+            plt.tight_layout()
+            plt.savefig(f'{self.dataset_name}/correlation_heatmap.png')
+            plt.close()
+        
+        # Categorical Column Distribution
+        categorical_columns = self.df.select_dtypes(include=['object']).columns
+        for col in categorical_columns:
+            try:
+                top_categories = self.df[col].value_counts().head(10)
+                plt.figure(figsize=(10, 6))
+                top_categories.plot(kind='bar')
+                plt.title(f'Top 10 Categories - {col}')
+                plt.xlabel(col)
+                plt.ylabel('Count')
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                plt.savefig(f'{self.dataset_name}/{col}_top_categories.png')
+                plt.close()
+            except Exception as e:
+                self.logger.warning(f"Could not create bar chart for {col}: {e}")
+
+    def get_ai_summary(self, analysis_summary: str) -> str:
+        """
+        Fetch AI-powered summary via proxy.
+        
+        Args:
+            analysis_summary (str): JSON-formatted analysis summary
+        
+        Returns:
+            str: AI-generated summary
+        """
+        load_dotenv()
+        api_token = os.getenv('AI_PROXY_TOKEN')
+        
         if not api_token:
-            raise ValueError("API token is required.")
+            self.logger.warning("No API token found. Skipping AI summary.")
+            return "No AI summary available."
 
         url = "https://aiproxy.sanand.workers.dev/openai/v1/chat/completions"
         headers = {
@@ -98,72 +234,23 @@ class DataAnalyzer:
         }
 
         try:
-            response = requests.post(url, headers=headers, data=json.dumps(payload))
+            response = requests.post(url, headers=headers, json=payload)
             response.raise_for_status()
             return response.json()['choices'][0]['message']['content']
         except Exception as e:
-            print(f"Error getting AI summary: {e}")
+            self.logger.error(f"Error getting AI summary: {e}")
             return "Unable to generate AI summary."
 
-    def analyze_data(self):
+    def generate_readme(self, analysis: Dict[str, Any], ai_summary: str) -> None:
         """
-        Perform comprehensive data analysis.
+        Generate comprehensive README.md for the analysis.
+        
+        Args:
+            analysis (Dict): Comprehensive dataset analysis
+            ai_summary (str): AI-generated summary
         """
-        analysis = {
-            'basic_info': {
-                'total_rows': len(self.df),
-                'columns': list(self.df.columns),
-                'column_types': {col: str(dtype) for col, dtype in self.df.dtypes.items()}
-            },
-            'missing_data': self.df.isnull().sum().to_dict(),
-            'summary_statistics': {}
-        }
-
-        numeric_columns = self.df.select_dtypes(include=[np.number]).columns
-        numeric_stats = self.df[numeric_columns].describe()
-        analysis['summary_statistics'] = json_serializable_dict(numeric_stats.to_dict())
-
-        if len(numeric_columns) > 1:
-            correlation_matrix = self.df[numeric_columns].corr()
-            analysis['correlation_matrix'] = json_serializable_dict(correlation_matrix.to_dict())
-
-        return analysis
-
-    def create_visualizations(self, analysis):
-        """
-        Create visualizations based on the dataset.
-        """
-        os.makedirs(self.dataset_name, exist_ok=True)
-
-        if 'correlation_matrix' in analysis:
-            plt.figure(figsize=(10, 8))
-            correlation_df = pd.DataFrame(analysis['correlation_matrix'])
-            sns.heatmap(correlation_df, annot=True, cmap='coolwarm', center=0)
-            plt.title(f'Correlation Heatmap - {self.dataset_name.capitalize()}')
-            plt.tight_layout()
-            plt.savefig(f'{self.dataset_name}/correlation_heatmap.png')
-            plt.close()
-
-        categorical_columns = self.df.select_dtypes(include=['object']).columns
-        for col in categorical_columns:
-            try:
-                top_categories = self.df[col].value_counts().head(10)
-                plt.figure(figsize=(10, 6))
-                top_categories.plot(kind='bar')
-                plt.title(f'Top 10 Categories - {col}')
-                plt.xlabel(col)
-                plt.ylabel('Count')
-                plt.xticks(rotation=45, ha='right')
-                plt.tight_layout()
-                plt.savefig(f'{self.dataset_name}/{col}_top_categories.png')
-                plt.close()
-            except Exception as e:
-                print(f"Could not create bar chart for {col}: {e}")
-
-    def generate_readme(self, analysis, ai_summary):
-        """
-        Generate README.md with analysis insights.
-        """
+        recommendations = DataRecommendationGenerator.generate_recommendations(analysis, self.df)
+        
         readme_content = f"""# Data Analysis Report: {self.dataset_name.capitalize()}
 
 ## Dataset Overview
@@ -174,7 +261,7 @@ class DataAnalyzer:
 ### Basic Information
 - Total Rows: {analysis['basic_info']['total_rows']}
 - Columns: {', '.join(analysis['basic_info']['columns'])}
-- Column Types: {analysis['basic_info']['column_types']}
+- Column Types: {json.dumps(analysis['basic_info']['column_types'], indent=2)}
 
 ### Missing Data
 {'\n'.join([f"- {col}: {count} missing values" for col, count in analysis['missing_data'].items() if count > 0])}
@@ -187,24 +274,29 @@ class DataAnalyzer:
 {'\n'.join([f"- [Top Categories - {col}]({col}_top_categories.png)" for col in self.df.select_dtypes(include=['object']).columns])}
 
 ## Recommendations
-{ai_summary.split('Recommendations:')[-1] if 'Recommendations:' in ai_summary else 'No specific recommendations could be generated.'}
+{recommendations}
 """
         with open(f'{self.dataset_name}/README.md', 'w') as f:
             f.write(readme_content)
 
 def main():
+    """Main script entry point."""
     if len(sys.argv) < 2:
-        print("Usage: uv run autolysis.py <path_to_csv_file>")
+        print("Usage: python autolysis.py <path_to_csv_file>")
         sys.exit(1)
 
     csv_path = sys.argv[1]
-    analyzer = DataAnalyzer(csv_path)
-
-    analysis = analyzer.analyze_data()
-    analysis_summary = json.dumps(json_serializable_dict(analysis), indent=2)
-    ai_summary = analyzer.get_ai_summary(analysis_summary)
-    analyzer.create_visualizations(analysis)
-    analyzer.generate_readme(analysis, ai_summary)
+    
+    try:
+        analyzer = DataAnalyzer(csv_path)
+        analysis = analyzer.analyze_data()
+        ai_summary = analyzer.get_ai_summary(json.dumps(analysis, indent=2))
+        analyzer.create_visualizations(analysis)
+        analyzer.generate_readme(analysis, ai_summary)
+        print(f"Analysis complete. Check the {analyzer.dataset_name} directory.")
+    except DataAnalysisError as e:
+        print(f"Analysis failed: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
